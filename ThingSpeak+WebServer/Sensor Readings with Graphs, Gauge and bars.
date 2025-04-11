@@ -1,0 +1,305 @@
+#include <WiFi.h> 
+#include "ThingSpeak.h"
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_BMP280.h>
+#include <WiFiClient.h>
+#include <DHT.h>
+
+// WiFi credentials
+const char *ssid = "PLACE HERE WIFI NAME";
+const char *password = "PLACE HERE WIFI PASSWORD";
+
+// Web server
+WiFiServer server(80);
+WiFiClient client;
+
+// Sensor Pins
+const int LDRPin = 36;
+const int trigPin = 27;
+const int echoPin = 26;
+const int MyLED = 2;
+const int DHTPin = 25;
+const int SoilPin = 33;
+
+#define DHTTYPE DHT11
+DHT dht(DHTPin, DHTTYPE);
+Adafruit_BMP280 bmp;
+
+String MyLEDState = "off"; 
+unsigned long lastUpdateTime = 0;
+
+//THINGSPEAK settings
+unsigned long myChannelNumber = PLACEHERENUMBER;
+const char *myWriteAPIKey = "PLACE HERE API KEY";
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+  pinMode(MyLED, OUTPUT);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  dht.begin();
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+  server.begin();
+  ThingSpeak.begin(client);
+
+  if (!bmp.begin(0x76)) Serial.println("BMP280 not found!");
+  else Serial.println("BMP280 initialized.");
+
+  if (dht.readHumidity() == NAN || dht.readTemperature() == NAN) Serial.println("DHT11 not found!");
+  else Serial.println("DHT11 initialized.");
+
+  int ldrValue = analogRead(LDRPin);
+  if (ldrValue < 0) Serial.println("LDR sensor not responding!");
+  else Serial.println("LDR sensor initialized.");
+
+  long duration = readWaterLevel();
+  if (duration <= 0) Serial.println("Ultrasonic sensor not responding!");
+  else Serial.println("Ultrasonic sensor initialized.");
+
+  Serial.println("Soil moisture sensor ready.");
+}
+
+void loop() {
+  WiFiClient client = server.available();
+  if (client) {
+    String request = client.readStringUntil('\r');
+    client.flush();
+
+    if (request.indexOf("GET /MyLED/on") >= 0) {
+      MyLEDState = "on";
+      digitalWrite(MyLED, HIGH);
+    } else if (request.indexOf("GET /MyLED/off") >= 0) {
+      MyLEDState = "off";
+      digitalWrite(MyLED, LOW);
+    }
+
+    if (request.indexOf("GET /data") >= 0) {
+      float lightIntensity = readLightIntensity();
+      float bmpTemperature = readAverageTemperature(5);
+      float dhtTemperature = readAverageTemperature11(5);
+      float pressure = bmp.readPressure() / 100;
+      float waterLevel = readWaterLevel();
+      float humidity = dht.readHumidity();
+      float soilMoisture = readSoilMoisture(); 
+
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: application/json; charset=UTF-8");
+      client.println("Connection: close");
+      client.println();
+      client.print("{\"light\":");
+      client.print(lightIntensity);
+      client.print(", \"bmpTemperature\":");
+      client.print(bmpTemperature);
+      client.print(", \"dhtTemperature\":");
+      client.print(dhtTemperature);
+      client.print(", \"pressure\":");
+      client.print(pressure);
+      client.print(", \"humidity\":");
+      client.print(humidity);
+      client.print(", \"waterLevel\":");
+      client.print(waterLevel);
+      client.print(", \"soilMoisture\":");
+      client.print(soilMoisture);
+      
+      client.println("}");
+    } 
+    // Default HTML page
+        else {
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html");
+            client.println("Connection: close");
+            client.println();
+
+            // HTML page
+            client.println("<!DOCTYPE html><html>");
+            client.println("<head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+            client.println("<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>");
+            client.println("<script src=\"https://bernii.github.io/gauge.js/dist/gauge.min.js\"></script>");
+            
+            client.println("<style>");
+            client.println("body { font-family: Arial, sans-serif; text-align: center; background: #ffdaff; }");
+            client.println(".section { background: white; padding: 20px; border-radius: 10px; box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.1); margin: 20px auto; width: 90%; max-width: 400px; }");
+            client.println(".bar-container { width: 100%; height: 30px; background: #e0e0e0; border-radius: 5px; overflow: hidden; }");
+            client.println("#waterBar { height: 100%; width: 0%; background: #0288d1; transition: width 0.5s; }");
+
+            // Updated LED button section styles
+            client.println(".button-container { display: flex; justify-content: center; gap: 15px; margin-top: 20px; }");
+            client.println(".led-button { padding: 15px 30px; font-size: 18px; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; transition: transform 0.2s, box-shadow 0.3s; outline: none; }");
+            client.println(".led-on { background-color: #ff69b4; color: white; }");
+            client.println(".led-off { background-color: #f44336; color: white; }");
+            client.println(".led-button:hover { transform: translateY(-4px); box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2); }");
+            client.println(".led-button:active { transform: translateY(2px); }");
+            client.println(".led-on, .led-off { animation: buttonAnimation 0.5s ease-out; }");
+            client.println("@keyframes buttonAnimation { 0% { opacity: 0; transform: scale(0.5); } 100% { opacity: 1; transform: scale(1); } }");
+            client.println("</style></head>");
+
+            client.println("<body>");
+            client.println("<h1>ESP32 Dashboard</h1>");
+            client.println("<div class='container'>");
+
+            // LED Control Section
+            client.println("<div class='section'>");
+            client.println("<h2>LED Control</h2>");
+            client.println("<p><strong>Status:</strong> " + MyLEDState + "</p>");
+            client.println("<div class='button-container'>");
+            if (MyLEDState == "off") {
+                client.println("<a href='/MyLED/on'><button class='led-button led-on'>Turn ON</button></a>");
+            } else {
+                client.println("<a href='/MyLED/off'><button class='led-button led-off'>Turn OFF</button></a>");
+            }
+            client.println("</div>");
+            client.println("</div>");
+
+            // Light Intensity Section
+            client.println("<div class='section'><h2>Light Intensity</h2>");
+            client.println("<p><strong>Current:</strong> <span id='lightValue'>0</span> Lux</p>");
+            client.println("<canvas id='lightChart'></canvas></div>");
+
+            // Temperature Chart
+            client.println("<div class='section'><h2>Temperature</h2>");
+            client.println("<canvas id='tempChart'></canvas></div>");
+
+            // Pressure Gauge Section
+            client.println("<div class='section'><h2>Pressure</h2>");
+            client.println("<canvas id='pressGauge'></canvas></div>");
+
+            // Humidity Section (Digital numbers)
+            client.println("<div class='section'><h2>Humidity</h2>");
+            client.println("<p><strong>Current:</strong> <span id='humidityValue' style='font-size: 48px; color: pink;'>0</span>%</p></div>");
+
+            // Water Level Section
+            client.println("<div class='section'><h2>Water Level</h2>");
+            client.println("<div class='bar-container'><div id='waterBar'></div></div>");
+            client.println("<p><strong>Current:</strong> <span id='waterValue'>0</span> cm</p>");
+            client.println("</div>");
+
+            //Soil Moisture Section
+            client.println("<div class='section'><h2>Soil Moisture</h2>");
+            client.println("<p><strong>Current:</strong> <span id='soilValue' style='font-size: 48px; color: pink;'>0</span></p></div>");
+
+            client.println("</div>"); // end of container
+
+            //JavaScript Section
+            client.println("<script>");
+            client.println("async function fetchData() {");
+            client.println("  const response = await fetch('/data');");
+            client.println("  const data = await response.json();");
+            client.println("  document.getElementById('lightValue').innerText = data.light;");
+            client.println("  document.getElementById('humidityValue').innerText = data.humidity;");
+            client.println("  document.getElementById('waterValue').innerText = data.waterLevel;");
+            client.println("  document.getElementById('waterBar').style.width = (data.waterLevel > 16 ? 16 : data.waterLevel) * 6.25 + '%';");
+            client.println("  document.getElementById('soilValue').innerText = data.soilMoisture;");
+
+            // Update chart data
+            client.println("  tempChart.data.datasets[0].data.push(data.bmpTemperature);");
+            client.println("  tempChart.data.datasets[1].data.push(data.dhtTemperature);");
+            client.println("  tempChart.data.labels.push(new Date().toLocaleTimeString());");
+            client.println("  if(tempChart.data.labels.length > 10) { tempChart.data.labels.shift(); tempChart.data.datasets[0].data.shift(); tempChart.data.datasets[1].data.shift(); }");
+            client.println("  tempChart.update();");
+
+            // Update light chart
+            client.println("  lightChart.data.datasets[0].data.push(data.light);");
+            client.println("  lightChart.data.labels.push(new Date().toLocaleTimeString());");
+            client.println("  if(lightChart.data.labels.length > 10) { lightChart.data.labels.shift(); lightChart.data.datasets[0].data.shift(); }");
+            client.println("  lightChart.update();");
+
+            // Update pressure gauge
+            client.println("  pressGauge.set(data.pressure);");
+            client.println("}");
+            client.println("setInterval(fetchData, 2000);");
+
+            // Temp chart config
+            client.println("const tempCtx = document.getElementById('tempChart').getContext('2d');");
+            client.println("const tempChart = new Chart(tempCtx, { type: 'line', data: { labels: [], datasets: [");
+            client.println("{ label: 'BMP280', data: [], borderColor: 'blue', fill: false },");
+            client.println("{ label: 'DHT11', data: [], borderColor: 'red', fill: false }");
+            client.println("]}, options: { responsive: true, scales: { y: { beginAtZero: true } } } });");
+
+            // Light chart config
+            client.println("const lightCtx = document.getElementById('lightChart').getContext('2d');");
+            client.println("const lightChart = new Chart(lightCtx, { type: 'line', data: { labels: [], datasets: [{ label: 'Light (Lux)', data: [], borderColor: '#ffa500', fill: false }] }, options: { responsive: true, scales: { y: { beginAtZero: true } } } });");
+
+            // Pressure gauge config
+            client.println("const gaugeOptions = { angle: 0, lineWidth: 0.2, radiusScale: 1, pointer: { length: 0.6, strokeWidth: 0.035, color: '#000000' }, limitMax: false, limitMin: false, highDpiSupport: true, staticZones: [");
+            client.println("{ strokeStyle: '#30B32D', min: 950, max: 1000 }, { strokeStyle: '#FFDD00', min: 1000, max: 1020 }, { strokeStyle: '#F03E3E', min: 1020, max: 1050 } ], staticLabels: { font: '10px sans-serif', labels: [950, 1000, 1050], color: '#000', fractionDigits: 0 } };");
+            client.println("const pressGaugeTarget = document.getElementById('pressGauge');");
+            client.println("const pressGauge = new Gauge(pressGaugeTarget).setOptions(gaugeOptions);");
+            client.println("pressGauge.maxValue = 1050; pressGauge.setMinValue(950); pressGauge.animationSpeed = 32; pressGauge.set(1000);");
+
+            client.println("</script>");
+            client.println("</body></html>");
+        }
+        delay(1);
+        client.stop();
+    }
+  
+
+  if (millis() - lastUpdateTime > 20000) {
+    float lightIntensity = readLightIntensity();
+    float bmpTemperature = readAverageTemperature(5);
+    float dhtTemperature = readAverageTemperature11(5);
+    float pressure = bmp.readPressure() / 100;
+    float waterLevel = readWaterLevel();
+    float humidity = dht.readHumidity();
+    float soilMoisture = readSoilMoisture(); 
+
+    ThingSpeak.setField(1, lightIntensity);
+    ThingSpeak.setField(2, bmpTemperature);
+    ThingSpeak.setField(3, dhtTemperature);
+    ThingSpeak.setField(4, pressure);
+    ThingSpeak.setField(5, humidity);
+    ThingSpeak.setField(6, waterLevel);
+    ThingSpeak.setField(7, soilMoisture); // Optional: Add to ThingSpeak
+    ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+
+    lastUpdateTime = millis();
+  }
+}
+
+// Sensor Functions
+float readLightIntensity() {
+  int sensorValue = analogRead(LDRPin);
+  float voltage = sensorValue * (3.3 / 4095.0); 
+  return (1 - (voltage / 3.3)) * 1000;
+}
+
+float readAverageTemperature(int numReadings) {
+  float tempSum = 0.0;
+  for (int i = 0; i < numReadings; i++) {
+    tempSum += bmp.readTemperature();
+    delay(50);
+  }
+  return tempSum / numReadings;
+}
+
+float readAverageTemperature11(int samples) {
+  float total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += dht.readTemperature();
+    delay(50);
+  }
+  return total / samples;
+}
+
+float readWaterLevel() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH);
+  float distance = duration * 0.034 / 2.0;
+  return std::max<float>(0, 20 - distance);
+}
+
+float readSoilMoisture() {
+  return analogRead(SoilPin);  // Return raw value (0 to 4095)
+}
